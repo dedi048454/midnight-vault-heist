@@ -1,3 +1,7 @@
+[![make.fun](https://make.fun/badge/best-heist-game-20261122-0559.svg)](https://make.fun/bounty/best-heist-game-20261122-0559)
+[![rank](https://make.fun/badge/best-heist-game-20261122-0559/dedi048454/midnight-vault-heist/rank.svg)](https://make.fun/bounty/best-heist-game-20261122-0559)
+[![reward](https://make.fun/badge/best-heist-game-20261122-0559/dedi048454/midnight-vault-heist/reward.svg)](https://make.fun/bounty/best-heist-game-20261122-0559)
+
 # Midnight Vault — The Grand Museum Heist
 
 Entry for the make.fun bounty **"Make the best heist game"**
