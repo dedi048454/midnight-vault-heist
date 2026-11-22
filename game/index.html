@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>Midnight Vault — The Grand Museum Heist</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #0b0e14; }
+  #game { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
+  #status { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+</style>
+</head>
+<body>
+<canvas id="game" aria-label="Midnight Vault: sneak past guards and cameras, steal the loot and escape"></canvas>
+<p id="status" role="status" aria-live="polite"></p>
+<script>
+'use strict';
+/* MIDNIGHT VAULT — a complete top-down stealth heist game.
+   Steal every loot item in the museum, dodge guard and camera vision
+   cones, keep the alarm below 100, then reach the green EXIT.
+   3 levels, rising difficulty. WASD / arrows to move, P pause, R restart.
+   No network, no assets: all art is drawn on canvas, sounds are WebAudio.
+   ?shot=start|play|end&seed=1 renders a fixed frame for screenshots. */
+const cv = document.getElementById('game');
+const ctx = cv.getContext('2d');
+const W = 960, H = 600;
+function fit() { const s = Math.min(innerWidth / W, innerHeight / H); cv.width = W; cv.height = H; cv.style.width = (W * s) + 'px'; cv.style.height = (H * s) + 'px'; }
+addEventListener('resize', fit); fit();
+
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const dist = (x1, y1, x2, y2) => Math.hypot(x2 - x1, y2 - y1);
+const angDiff = (a, b) => { let d = a - b; while (d > Math.PI) d -= 2 * Math.PI; while (d < -Math.PI) d += 2 * Math.PI; return d; };
+
+// ---- levels: walls [x,y,w,h], loot {x,y,kind,value}, guards {path, speed},
+//      cameras {x,y,base,sweep,speed}, exit {x,y}, player start ----------
+const LEVELS = [
+ { name: 'GALLERY ONE', walls: [[0,0,960,14],[0,586,960,14],[0,0,14,600],[946,0,14,600],[300,120,14,180],[300,120,220,14],[640,300,14,180],[640,300,200,14],[120,420,220,14]],
+   loot: [{x:200,y:90,kind:'GOLD',value:500},{x:880,y:120,kind:'DIAMOND',value:1000},{x:500,y:520,kind:'PAINTING',value:750}],
+   guards: [{path:[[420,80],[420,480]],speed:1.1},{path:[[760,200],[760,520]],speed:1.0}],
+   cameras: [{x:480,y:14,base:Math.PI/2,sweep:0.9,speed:0.010}],
+   exit: {x:60,y:540}, start: {x:60,y:60} },
+ { name: 'THE VAULT WING', walls: [[0,0,960,14],[0,586,960,14],[0,0,14,600],[946,0,14,600],[200,100,14,220],[200,100,260,14],[520,260,14,220],[520,260,280,14],[760,80,14,200],[120,440,300,14]],
+   loot: [{x:130,y:90,kind:'GOLD',value:500},{x:880,y:90,kind:'DIAMOND',value:1000},{x:880,y:520,kind:'PAINTING',value:750},{x:440,y:520,kind:'GOLD',value:500}],
+   guards: [{path:[[340,60],[340,520]],speed:1.3},{path:[[640,80],[640,520]],speed:1.2},{path:[[880,220],[500,220]],speed:1.1}],
+   cameras: [{x:300,y:14,base:Math.PI/2,sweep:1.0,speed:0.013},{x:700,y:586,base:-Math.PI/2,sweep:1.0,speed:0.013}],
+   exit: {x:60,y:540}, start: {x:60,y:60} },
+ { name: 'THE CROWN JEWELS', walls: [[0,0,960,14],[0,586,960,14],[0,0,14,600],[946,0,14,600],[180,90,14,240],[180,90,300,14],[480,220,14,260],[480,220,300,14],[780,80,14,240],[120,460,320,14],[640,440,200,14]],
+   loot: [{x:110,y:80,kind:'GOLD',value:500},{x:900,y:80,kind:'CROWN',value:1500},{x:900,y:520,kind:'DIAMOND',value:1000},{x:560,y:520,kind:'PAINTING',value:750},{x:300,y:520,kind:'GOLD',value:500}],
+   guards: [{path:[[300,60],[300,520]],speed:1.5},{path:[[580,60],[580,520]],speed:1.4},{path:[[880,200],[600,200]],speed:1.3},{path:[[420,380],[880,380]],speed:1.2}],
+   cameras: [{x:240,y:14,base:Math.PI/2,sweep:1.1,speed:0.016},{x:720,y:14,base:Math.PI/2,sweep:1.1,speed:0.016},{x:480,y:586,base:-Math.PI/2,sweep:1.0,speed:0.015}],
+   exit: {x:60,y:540}, start: {x:60,y:60} },
+];
+const LOOT_DRAW = { GOLD: '#f2b705', DIAMOND: '#2dd4bf', PAINTING: '#e5484d', CROWN: '#c084fc' };
+
+const state = {
+  screen: 'title', level: 0, score: 0, alarm: 0, time: 0, lootGot: 0,
+  player: { x: 60, y: 60, r: 12 }, keys: {}, msg: '', msgT: 0,
+  guards: [], cameras: [], loot: [], won: false, caught: false, levelBonus: 0,
+};
+window.GAME = state;
+
+function loadLevel(i) {
+  const L = LEVELS[i];
+  state.level = i; state.alarm = 0; state.time = 0; state.lootGot = 0; state.caught = false;
+  state.player.x = L.start.x; state.player.y = L.start.y;
+  state.guards = L.guards.map(g => ({ path: g.path, speed: g.speed, seg: 0, t: 0, x: g.path[0][0], y: g.path[0][1], dir: 0 }));
+  state.cameras = L.cameras.map(c => ({ ...c, a: c.base }));
+  state.loot = L.loot.map(l => ({ ...l, got: false }));
+  state.msg = LEVELS[i].name + ' — STEAL EVERYTHING, THEN ESCAPE!'; state.msgT = 180;
+}
+function beep(freq, dur, type) {
+  try {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    state._ac = state._ac || new AC();
+    const o = state._ac.createOscillator(), g = state._ac.createGain();
+    o.type = type || 'sine'; o.frequency.value = freq;
+    g.gain.setValueAtTime(0.08, state._ac.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, state._ac.currentTime + dur);
+    o.connect(g); g.connect(state._ac.destination); o.start(); o.stop(state._ac.currentTime + dur);
+  } catch (e) { /* audio unavailable: play silently */ }
+}
+function hitWall(x, y, r) {
+  for (const w of LEVELS[state.level].walls) {
+    if (x + r > w[0] && x - r < w[0] + w[2] && y + r > w[1] && y - r < w[1] + w[3]) return true;
+  }
+  return false;
+}
+function inCone(px, py, cx, cy, dir, range, half) {
+  const d = dist(px, py, cx, cy);
+  if (d > range) return false;
+  return Math.abs(angDiff(Math.atan2(py - cy, px - cx), dir)) < half;
+}
+function update() {
+  if (state.screen !== 'play') return;
+  state.time++;
+  const p = state.player, sp = 3.2;
+  let dx = 0, dy = 0;
+  if (state.keys['arrowup'] || state.keys['w']) dy -= 1;
+  if (state.keys['arrowdown'] || state.keys['s']) dy += 1;
+  if (state.keys['arrowleft'] || state.keys['a']) dx -= 1;
+  if (state.keys['arrowright'] || state.keys['d']) dx += 1;
+  if (dx || dy) {
+    const n = Math.hypot(dx, dy); dx /= n; dy /= n;
+    const nx = p.x + dx * sp, ny = p.y + dy * sp;
+    if (!hitWall(nx, p.y, p.r)) p.x = nx;
+    if (!hitWall(p.x, ny, p.r)) p.y = ny;
+    p.x = clamp(p.x, 20, W - 20); p.y = clamp(p.y, 20, H - 20);
+  }
+  // guards patrol
+  let seen = false;
+  for (const g of state.guards) {
+    const a = g.path[g.seg], b = g.path[(g.seg + 1) % g.path.length];
+    const d = dist(g.x, g.y, b[0], b[1]);
+    if (d < g.speed) { g.seg = (g.seg + 1) % g.path.length; }
+    else {
+      g.dir = Math.atan2(b[1] - g.y, b[0] - g.x);
+      g.x += Math.cos(g.dir) * g.speed; g.y += Math.sin(g.dir) * g.speed;
+    }
+    if (inCone(p.x, p.y, g.x, g.y, g.dir, 175, 0.62)) seen = true;
+  }
+  for (const c of state.cameras) {
+    c.a = c.base + Math.sin(state.time * c.speed) * c.sweep;
+    if (inCone(p.x, p.y, c.x, c.y, c.a, 165, 0.5)) seen = true;
+  }
+  if (seen) { state.alarm = Math.min(100, state.alarm + 1.1); if (state.time % 30 === 0) beep(220, 0.12, 'square'); }
+  else state.alarm = Math.max(0, state.alarm - 0.25);
+  if (state.alarm >= 100) {
+    state.caught = true; state.screen = 'caught'; beep(110, 0.5, 'sawtooth');
+    document.getElementById('status').textContent = 'Caught! Alarm hit 100.';
+    return;
+  }
+  // loot
+  for (const l of state.loot) {
+    if (!l.got && dist(p.x, p.y, l.x, l.y) < 26) {
+      l.got = true; state.lootGot++; state.score += l.value;
+      state.msg = '+' + l.value + ' — ' + l.kind + ' STOLEN!'; state.msgT = 90; beep(880, 0.15);
+    }
+  }
+  // exit
+  const L = LEVELS[state.level], ex = L.exit;
+  if (state.lootGot === L.loot.length && dist(p.x, p.y, ex.x, ex.y) < 34) {
+    state.levelBonus = Math.max(0, 1000 - Math.floor(state.time / 60) * 10);
+    state.score += state.levelBonus;
+    if (state.level + 1 >= LEVELS.length) { state.won = true; state.screen = 'win'; beep(660, 0.2); setTimeout(() => beep(990, 0.3), 180); }
+    else { state.msg = 'LEVEL CLEAR! BONUS +' + state.levelBonus; state.msgT = 120; beep(660, 0.2); loadLevel(state.level + 1); }
+  }
+  if (state.msgT > 0) state.msgT--;
+}
+
+function conePath(x, y, dir, range, half) {
+  ctx.beginPath(); ctx.moveTo(x, y);
+  ctx.arc(x, y, range, dir - half, dir + half); ctx.closePath();
+}
+function draw() {
+  ctx.fillStyle = '#0b0e14'; ctx.fillRect(0, 0, W, H);
+  const L = LEVELS[state.level];
+  // floor tiles
+  ctx.fillStyle = '#141a26';
+  for (let x = 0; x < W; x += 60) for (let y = 0; y < H; y += 60) if ((x + y) / 60 % 2 === 0) ctx.fillRect(x, y, 60, 60);
+  // exit
+  const open = state.lootGot === L.loot.length;
+  ctx.fillStyle = open ? '#22c55e' : '#14532d';
+  ctx.fillRect(L.exit.x - 22, L.exit.y - 22, 44, 44);
+  ctx.fillStyle = '#fff'; ctx.font = 'bold 11px sans-serif'; ctx.textAlign = 'center';
+  ctx.fillText('EXIT', L.exit.x, L.exit.y + 4);
+  // loot
+  for (const l of state.loot) {
+    if (l.got) continue;
+    ctx.fillStyle = LOOT_DRAW[l.kind];
+    if (l.kind === 'PAINTING') { ctx.fillRect(l.x - 16, l.y - 12, 32, 24); ctx.strokeStyle = '#fff'; ctx.strokeRect(l.x - 16, l.y - 12, 32, 24); }
+    else if (l.kind === 'DIAMOND') { ctx.beginPath(); ctx.moveTo(l.x, l.y - 12); ctx.lineTo(l.x + 11, l.y); ctx.lineTo(l.x, l.y + 12); ctx.lineTo(l.x - 11, l.y); ctx.closePath(); ctx.fill(); }
+    else if (l.kind === 'CROWN') { ctx.beginPath(); ctx.moveTo(l.x - 12, l.y + 8); ctx.lineTo(l.x - 12, l.y - 6); ctx.lineTo(l.x - 6, l.y); ctx.lineTo(l.x, l.y - 10); ctx.lineTo(l.x + 6, l.y); ctx.lineTo(l.x + 12, l.y - 6); ctx.lineTo(l.x + 12, l.y + 8); ctx.closePath(); ctx.fill(); }
+    else { ctx.fillRect(l.x - 10, l.y - 7, 20, 14); }
+    ctx.fillStyle = '#fff'; ctx.font = '9px sans-serif';
+    ctx.fillText('$' + l.value, l.x, l.y + 26);
+  }
+  // vision cones (under characters)
+  for (const g of state.guards) { conePath(g.x, g.y, g.dir, 175, 0.62); ctx.fillStyle = 'rgba(242,183,5,0.20)'; ctx.fill(); }
+  for (const c of state.cameras) { conePath(c.x, c.y, c.a, 165, 0.5); ctx.fillStyle = 'rgba(229,72,77,0.22)'; ctx.fill(); }
+  // walls
+  ctx.fillStyle = '#2b3446';
+  for (const w of L.walls) ctx.fillRect(w[0], w[1], w[2], w[3]);
+  ctx.strokeStyle = '#4b5a75'; ctx.lineWidth = 2;
+  for (const w of L.walls) ctx.strokeRect(w[0], w[1], w[2], w[3]);
+  // cameras
+  for (const c of state.cameras) { ctx.fillStyle = '#e5484d'; ctx.beginPath(); ctx.arc(c.x, c.y, 8, 0, 7); ctx.fill(); ctx.fillStyle = '#fff'; ctx.font = '8px sans-serif'; ctx.fillText('CAM', c.x, c.y - 12); }
+  // guards
+  for (const g of state.guards) {
+    ctx.fillStyle = '#f97316'; ctx.beginPath(); ctx.arc(g.x, g.y, 13, 0, 7); ctx.fill();
+    ctx.fillStyle = '#fff'; ctx.font = 'bold 10px sans-serif'; ctx.fillText('G', g.x, g.y + 4);
+  }
+  // player
+  const p = state.player;
+  ctx.fillStyle = '#111'; ctx.beginPath(); ctx.arc(p.x, p.y, p.r + 2, 0, 7); ctx.fill();
+  ctx.fillStyle = '#2dd4bf'; ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, 7); ctx.fill();
+  ctx.fillStyle = '#0b0e14'; ctx.font = 'bold 11px sans-serif'; ctx.fillText('YOU', p.x, p.y + 4);
+  // HUD
+  ctx.fillStyle = 'rgba(10,18,30,0.92)'; ctx.fillRect(0, 0, W, 46);
+  ctx.fillStyle = '#f2b705'; ctx.font = 'bold 20px sans-serif'; ctx.textAlign = 'left';
+  ctx.fillText('MIDNIGHT VAULT', 14, 30);
+  ctx.fillStyle = '#fff'; ctx.font = '16px sans-serif';
+  ctx.fillText('SCORE $' + state.score, 230, 29);
+  ctx.fillText('LOOT ' + state.lootGot + '/' + L.loot.length, 400, 29);
+  ctx.fillText('LEVEL ' + (state.level + 1) + '/3', 520, 29);
+  ctx.fillText(Math.floor(state.time / 60) + 's', 620, 29);
+  // alarm meter
+  ctx.fillStyle = '#fff'; ctx.font = 'bold 13px sans-serif'; ctx.fillText('ALARM', 680, 29);
+  ctx.fillStyle = '#1f2937'; ctx.fillRect(740, 14, 200, 18);
+  ctx.fillStyle = state.alarm < 50 ? '#22c55e' : state.alarm < 80 ? '#f2b705' : '#e5484d';
+  ctx.fillRect(740, 14, 200 * state.alarm / 100, 18);
+  ctx.strokeStyle = '#fff'; ctx.strokeRect(740, 14, 200, 18);
+  ctx.fillStyle = '#fff'; ctx.font = 'bold 11px sans-serif'; ctx.textAlign = 'center';
+  ctx.fillText(Math.floor(state.alarm) + '%', 840, 27); ctx.textAlign = 'left';
+  if (state.msgT > 0) {
+    ctx.fillStyle = 'rgba(242,183,5,0.95)'; ctx.font = 'bold 18px sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText(state.msg, W / 2, 84); ctx.textAlign = 'left';
+  }
+  if (state.screen === 'title') overlay('MIDNIGHT VAULT', 'The Grand Museum Heist', [
+    'Steal every loot item, dodge guard and camera vision cones,',
+    'keep the ALARM below 100, then escape through the green EXIT.',
+    '', 'Move: WASD or Arrow Keys   •   Pause: P   •   Restart: R',
+    '', '3 levels — guards get faster, cones get wider. Good luck, thief.',
+    '', 'CLICK or press ENTER to start']);
+  if (state.screen === 'caught') overlay('CAUGHT!', 'The alarm hit 100% — security swarmed the gallery.', [
+    'Score: $' + state.score + '   •   Level ' + (state.level + 1) + '   •   Loot ' + state.lootGot + '/' + L.loot.length,
+    '', 'Press R or CLICK to retry this level']);
+  if (state.screen === 'win') overlay('HEIST COMPLETE!', 'Every jewel, every painting — clean getaway.', [
+    'FINAL SCORE: $' + state.score,
+    'You beat all 3 levels of the Grand Museum.',
+    '', 'Press R or CLICK to play again']);
+  if (state.screen === 'paused') overlay('PAUSED', '', ['Press P to resume']);
+}
+function overlay(title, sub, lines) {
+  ctx.fillStyle = 'rgba(5,8,14,0.82)'; ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = '#f2b705'; ctx.font = 'bold 44px sans-serif'; ctx.textAlign = 'center';
+  ctx.fillText(title, W / 2, 200);
+  ctx.fillStyle = '#fff'; ctx.font = '20px sans-serif';
+  ctx.fillText(sub, W / 2, 240);
+  ctx.font = '16px sans-serif'; ctx.fillStyle = '#cbd5e1';
+  lines.forEach((ln, i) => ctx.fillText(ln, W / 2, 290 + i * 26));
+  ctx.textAlign = 'left';
+}
+function loop() { update(); draw(); requestAnimationFrame(loop); }
+
+addEventListener('keydown', e => {
+  const k = e.key.toLowerCase();
+  if (['arrowup', 'arrowdown', 'arrowleft', 'arrowright', ' '].includes(k)) e.preventDefault();
+  state.keys[k] = true;
+  if (k === 'p' && (state.screen === 'play' || state.screen === 'paused')) state.screen = state.screen === 'play' ? 'paused' : 'play';
+  if (k === 'r' && (state.screen === 'caught' || state.screen === 'win' || state.screen === 'play')) { state.score = state.screen === 'play' ? state.score : 0; loadLevel(state.screen === 'play' ? state.level : 0); if (state.screen !== 'play') state.score = 0; state.screen = 'play'; }
+  if ((k === 'enter' || k === ' ') && state.screen === 'title') { state.score = 0; loadLevel(0); state.screen = 'play'; }
+});
+addEventListener('keyup', e => { state.keys[e.key.toLowerCase()] = false; });
+addEventListener('mousedown', () => {
+  if (state.screen === 'title') { state.score = 0; loadLevel(0); state.screen = 'play'; }
+  else if (state.screen === 'caught' || state.screen === 'win') { state.score = 0; loadLevel(0); state.screen = 'play'; }
+});
+
+// screenshot modes: fixed, deterministic frames
+const params = new URLSearchParams(location.search);
+const shot = params.get('shot');
+loadLevel(0);
+if (shot === 'start') { state.screen = 'title'; }
+else if (shot === 'play') {
+  state.screen = 'play'; state.score = 1500; state.lootGot = 1; state.loot[0].got = true;
+  state.player.x = 470; state.player.y = 300; state.alarm = 34; state.time = 75 * 60;
+  state.guards[0].x = 420; state.guards[0].y = 200; state.guards[0].dir = Math.PI / 2;
+  state.guards[1].x = 760; state.guards[1].y = 420; state.guards[1].dir = -Math.PI / 2;
+  state.msg = 'DIAMOND STOLEN! +$1000'; state.msgT = 99999;
+}
+else if (shot === 'end') { state.screen = 'win'; state.score = 7250; }
+draw();
+if (!shot) loop();
+</script>
+</body>
+</html>
